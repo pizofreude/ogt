@@ -19,12 +19,28 @@ const MARKER: &str = "ogt shim v1";
 /// Render one shim script for `program`, invoking `ogt_exe` (the
 /// absolute path of the running ogt binary, from
 /// `std::env::current_exe()`).
+///
+/// `OGT_SHIM_DIR` must be expressed in the same form the platform's
+/// `PATH` uses, because `cli::path_shim` removes it from `PATH` by exact
+/// string comparison against `std::env::split_paths`. On Unix `cd && pwd`
+/// already yields that form. Under MSYS/Git Bash it does not: a native
+/// Windows `ogt.exe` receives `PATH` with Windows entries (`C:\Users\...`),
+/// while `cd && pwd` yields a POSIX path (`/c/Users/...`). The comparison
+/// then never matches, the recursion guard silently fails, ogt resolves
+/// `program` back to its own shim, and the spawn dies with
+/// `%1 is not a valid Win32 application. (os error 193)`. Normalizing
+/// through `cygpath -w` when it is on `PATH` keeps both sides in
+/// agreement. On Unix `cygpath` is absent and the branch is skipped, so
+/// this stays a no-op there.
 pub(crate) fn render_shim(ogt_exe: &str, program: &str) -> String {
     use crate::cli::OGT_SHIM_DIR as VAR;
     format!(
         "#!/bin/sh\n\
          # {MARKER}\n\
          {VAR}=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n\
+         if command -v cygpath >/dev/null 2>&1; then\n\
+         {VAR}=\"$(cygpath -w \"${{{VAR}}}\")\"\n\
+         fi\n\
          export {VAR}\n\
          exec \"{ogt_exe}\" {program} \"$@\"\n"
     )
@@ -58,6 +74,29 @@ mod tests {
         assert_ne!(grep, cat);
         assert!(grep.contains(" grep \"$@\""));
         assert!(cat.contains(" cat \"$@\""));
+    }
+
+    /// The recursion guard in `cli::path_shim` strips `OGT_SHIM_DIR` from
+    /// `PATH` by exact string comparison against `env::split_paths`. On
+    /// Windows that form is native (`C:\...`, `;`-separated), so a POSIX-only
+    /// shim dir can never match, and the guard fails silently by resolving the
+    /// program back to the shim itself (os error 193). The rendered shim must
+    /// therefore normalize through `cygpath` when it is available.
+    #[test]
+    fn render_shim_normalizes_the_shim_dir_to_the_platform_form() {
+        let script = render_shim("/abs/ogt", "grep");
+        assert!(
+            script.contains("command -v cygpath"),
+            "shim must probe for cygpath:\n{script}"
+        );
+        assert!(
+            script.contains("cygpath -w"),
+            "shim must normalize OGT_SHIM_DIR to the Windows form:\n{script}"
+        );
+        assert!(
+            script.contains("OGT_SHIM_DIR=\"$(cygpath -w \"${OGT_SHIM_DIR}\")\""),
+            "normalization must rewrite OGT_SHIM_DIR in place:\n{script}"
+        );
     }
 
     #[test]
