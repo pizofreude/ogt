@@ -11,6 +11,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - Add GitHub Actions workflows for release validation, preparation, and publication.
 - Add version, provenance, archive, and checksum release helpers.
 
+### Fixed
+
+- Normalize a PATH shim's `OGT_SHIM_DIR` to the platform's native path form. The recursion
+  guard in `cli::path_shim` compares `OGT_SHIM_DIR` against `PATH` entries by exact string,
+  and a native Windows `ogt.exe` sees Windows entries (`C:\Users\...`), while the shim's
+  `cd && pwd` yields a POSIX path (`/c/Users/...`). Under MSYS/Git Bash the two could never
+  match, so the shim directory was never stripped, ogt resolved the target program back to
+  its own shim, and every PATH shim failed with
+  `%1 is not a valid Win32 application. (os error 193)`. The shim now rewrites
+  `OGT_SHIM_DIR` through `cygpath -w` when `cygpath` is available, which is a no-op on Unix.
+
 ## [0.1.0] - 2026-08-31
 
 ### Added
