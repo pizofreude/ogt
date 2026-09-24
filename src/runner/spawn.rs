@@ -483,9 +483,18 @@ mod tests {
         assert!(out.contains(&0), "the NUL byte must survive");
     }
 
+    /// The bytes ON DISK were never the problem — this test passed throughout
+    /// the defect, which is exactly why the defect survived. It is kept for that
+    /// half of the contract, with the capture type corrected, and the caller's
+    /// stream is asserted separately by
+    /// `binary_above_the_gate_reaches_the_caller_byte_for_byte`.
+    ///
+    /// Caught in CI, not locally: this test is `#[cfg(unix)]`, so a Windows
+    /// `cargo test` compiles it out and cannot exercise it. Worth remembering
+    /// before trusting a green run on one platform.
     #[test]
     #[cfg(unix)]
-    fn binary_folded_run_persists_invalid_utf8_exactly() {
+    fn binary_run_persists_invalid_utf8_exactly_on_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -499,9 +508,14 @@ mod tests {
         )
         .unwrap();
 
-        let FoldOutcome::Folded(fold) = outcome.stdout else {
-            panic!("expected stdout to fold");
-        };
+        // `emit` collapses this variant to `FoldOutcome::Passthrough` for the
+        // caller, so the stream is asserted here and the spilled bytes are read
+        // back from disk rather than reached through a `Fold` handle.
+        assert!(
+            matches!(outcome.stdout, FoldOutcome::Passthrough),
+            "invalid UTF-8 above the gate must not be folded"
+        );
+
         let line = b"\xff\xfe\x80\x01abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuv\n";
         let expected: Vec<u8> = line
             .iter()
@@ -509,8 +523,20 @@ mod tests {
             .cycle()
             .take(line.len() * 4_000)
             .collect();
-        assert_eq!(std::fs::read(&fold.path).unwrap(), expected);
-        assert_eq!(fold.raw_bytes, expected.len());
+
+        assert_eq!(out, expected, "the caller must receive the bytes exactly");
+        let spilled: Vec<std::path::PathBuf> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        assert_eq!(spilled.len(), 1, "exactly one spill file, got {spilled:?}");
+        assert_eq!(
+            std::fs::read(&spilled[0]).unwrap(),
+            expected,
+            "the spilled file must hold every byte exactly"
+        );
     }
 
     #[test]
