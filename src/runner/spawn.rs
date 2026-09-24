@@ -9,6 +9,7 @@
 //! reader thread — still reaps the child through it.
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -254,6 +255,16 @@ fn emit(capture: StreamCapture, dest: &mut dyn Write) -> io::Result<FoldOutcome>
             dest.flush()?;
             Ok(FoldOutcome::Folded(fold))
         }
+        StreamCapture::BinaryPassthrough(fold) => {
+            // The stream crossed the gate but is not text, so it is written to
+            // the real fd unchanged. Streamed from the fold file rather than
+            // held in memory, so a large stream stays bounded, and `render` is
+            // never called — that is the whole point of this variant.
+            let mut reader = io::BufReader::new(File::open(&fold.path)?);
+            io::copy(&mut reader, dest)?;
+            dest.flush()?;
+            Ok(FoldOutcome::Passthrough)
+        }
     }
 }
 
@@ -369,6 +380,107 @@ mod tests {
         assert!(printed.contains("line 1\n"));
         assert!(printed.contains("line 40000"));
         assert!(printed.contains("[full output: "));
+    }
+
+    /// THE REGRESSION. The gate is a size gate, so a binary stream larger than
+    /// the threshold used to take the fold path — and `Fold::render` returns a
+    /// `String`, so it decoded as UTF-8 and replaced every invalid byte with
+    /// U+FFFD. Measured 2026-09-24: a 129,292-byte PNG came back as 16,124
+    /// mangled bytes, and the mangled bytes contained `efbfbd`.
+    ///
+    /// The sibling test above asserts the fold FILE keeps the bytes exactly,
+    /// which was always true and is why this went unnoticed: the file was fine
+    /// and only the PRINTED stream was corrupt. This asserts what the caller
+    /// actually receives.
+    #[test]
+    #[cfg(unix)]
+    fn binary_above_the_gate_reaches_the_caller_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        // 200 KB of a repeated invalid-UTF-8 pattern, well past the gate.
+        let outcome = run_with(
+            sh(r"i=0; while [ $i -lt 4000 ]; do printf '\377\376\200\001abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuv\n'; i=$((i+1)); done"),
+            &cfg(tmp.path(), 100),
+            &no_track(),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+
+        let line = b"\xff\xfe\x80\x01abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuv\n";
+        let expected: Vec<u8> = line
+            .iter()
+            .copied()
+            .cycle()
+            .take(line.len() * 4_000)
+            .collect();
+
+        assert!(
+            matches!(outcome.stdout, FoldOutcome::Passthrough),
+            "a binary stream must not be reported as folded"
+        );
+        assert_eq!(
+            out,
+            expected,
+            "the caller must receive the child's bytes exactly; a lossy decode \
+             would show {} bytes and contain efbfbd",
+            out.len()
+        );
+        assert!(
+            !out.windows(3).any(|w| w == [0xef, 0xbf, 0xbd]),
+            "the output contains U+FFFD, so it went through a UTF-8 decode"
+        );
+        assert!(err.is_empty());
+    }
+
+    /// The other direction: a TEXT stream above the gate must still fold. A
+    /// fix that stopped folding whenever bytes were unusual would silently
+    /// disable the feature.
+    #[test]
+    #[cfg(unix)]
+    fn text_above_the_gate_still_folds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = run_with(
+            sh("seq 1 40000 | sed 's/^/line /'"),
+            &cfg(tmp.path(), 100),
+            &no_track(),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+
+        assert!(matches!(outcome.stdout, FoldOutcome::Folded(_)));
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("[full output: "), "got: {printed}");
+    }
+
+    /// A NUL byte is binary on its own, even when the rest decodes as UTF-8.
+    /// Valid UTF-8 text contains no NUL, and a leading one is the conventional
+    /// binary-file signature, so it must not reach the renderer.
+    #[test]
+    #[cfg(unix)]
+    fn a_nul_byte_alone_marks_the_stream_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let outcome = run_with(
+            sh(r"i=0; while [ $i -lt 4000 ]; do printf 'text\000more text padding padding padding\n'; i=$((i+1)); done"),
+            &cfg(tmp.path(), 100),
+            &no_track(),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(outcome.stdout, FoldOutcome::Passthrough),
+            "a stream containing NUL must pass through unfolded"
+        );
+        assert!(out.contains(&0), "the NUL byte must survive");
     }
 
     #[test]

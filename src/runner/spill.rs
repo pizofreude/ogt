@@ -39,6 +39,14 @@ pub(crate) enum StreamCapture {
     Passthrough(Vec<u8>),
     /// Crossed the gate: full output is on disk, this is the summary of it.
     Folded(Fold),
+    /// Crossed the gate but is NOT text, so no summary was made. Every byte is
+    /// on disk at `Fold::path` and is written to the real fd unchanged.
+    ///
+    /// The gate is a SIZE gate, and a fold renders through a `String`, which
+    /// decodes as UTF-8 and substitutes U+FFFD for each invalid byte. That is
+    /// correct for text and destructive for anything else, so a non-text stream
+    /// must never take the `Folded` path.
+    BinaryPassthrough(Fold),
 }
 
 impl StreamCapture {
@@ -49,6 +57,7 @@ impl StreamCapture {
         match self {
             StreamCapture::Passthrough(bytes) => bytes.len(),
             StreamCapture::Folded(fold) => fold.raw_bytes,
+            StreamCapture::BinaryPassthrough(fold) => fold.raw_bytes,
         }
     }
 
@@ -58,6 +67,8 @@ impl StreamCapture {
         match self {
             StreamCapture::Passthrough(bytes) => bytes.len(),
             StreamCapture::Folded(fold) => fold.kept_bytes,
+            // Every byte reaches the caller; nothing was summarised.
+            StreamCapture::BinaryPassthrough(fold) => fold.raw_bytes,
         }
     }
 
@@ -65,13 +76,34 @@ impl StreamCapture {
         matches!(self, StreamCapture::Folded(_))
     }
 
-    /// Path to the full output on disk, if this stream folded.
+    /// Path to the full output on disk, if this stream crossed the gate.
     pub(crate) fn fold_path(&self) -> Option<&std::path::Path> {
         match self {
             StreamCapture::Passthrough(_) => None,
             StreamCapture::Folded(fold) => Some(&fold.path),
+            StreamCapture::BinaryPassthrough(fold) => Some(&fold.path),
         }
     }
+}
+
+/// Whether a run of bytes cannot be safely rendered as text.
+///
+/// A fold's summary goes through `Fold::render`, which returns a `String`, so
+/// the fold path decodes as UTF-8 and replaces every invalid byte with U+FFFD.
+/// Measured 2026-09-24: a 129,292-byte PNG arrived through the `git` shim as
+/// 16,124 mangled bytes, and a 2 MB `cat` as 16,127. The mangled bytes contained
+/// `efbfbd`, the UTF-8 encoding of U+FFFD, which is what proves a decode rather
+/// than a truncation. The corruption was invisible because only the printed
+/// stream changed; the fold file kept the true bytes.
+///
+/// `spawn::emit` already promises that passthrough bytes are written raw,
+/// "never through a `String`, never a lossy decode". This applies the same rule
+/// one step earlier, at the gate, which is where the decision is made.
+///
+/// A NUL byte counts on its own: valid UTF-8 text does not contain one, and a
+/// leading NUL is the conventional signature of a binary file.
+fn payload_is_binary(bytes: &[u8]) -> bool {
+    bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
 }
 
 enum State {
@@ -101,6 +133,10 @@ pub(crate) struct StreamSink {
     head: Vec<u8>,
     /// Trailing window, bounded by `TAIL_RING_MAX`.
     tail: Vec<u8>,
+    /// Set when the buffered prefix turned out not to be text. The stream still
+    /// spills, so memory stays bounded, but it is reported as
+    /// `BinaryPassthrough` and never rendered as a summary.
+    binary: bool,
 }
 
 impl StreamSink {
@@ -122,6 +158,7 @@ impl StreamSink {
             last_byte: None,
             head: Vec::new(),
             tail: Vec::new(),
+            binary: false,
         }
     }
 
@@ -139,7 +176,23 @@ impl StreamSink {
         let crossed = match &mut self.state {
             State::Buffering(buf) => {
                 buf.extend_from_slice(chunk);
-                self.enabled && estimate_tokens_len(self.raw_bytes) >= self.threshold_tokens
+                if self.enabled
+                    && !self.binary
+                    && estimate_tokens_len(self.raw_bytes) >= self.threshold_tokens
+                {
+                    // Decide HERE, while the buffered prefix is still in memory.
+                    // Crossing commits the stream to a fold, and a fold renders
+                    // through a `String`; after spilling only a byte count and a
+                    // bounded tail ring survive, so this is the last moment the
+                    // bytes can be inspected at all.
+                    //
+                    // A binary stream still spills — that is what keeps memory
+                    // bounded — but is reported unfolded.
+                    self.binary = payload_is_binary(buf);
+                    true
+                } else {
+                    false
+                }
             }
             State::Spilling(writer) => {
                 writer.write_all(chunk)?;
@@ -207,13 +260,21 @@ impl StreamSink {
                 let path = self
                     .path
                     .ok_or_else(|| io::Error::other("spilled stream has no fold file path"))?;
-                Ok(StreamCapture::Folded(Fold::from_regions(
+                let fold = Fold::from_regions(
                     &self.head,
                     &self.tail,
                     total_lines_from(self.newlines, self.last_byte),
                     self.raw_bytes,
                     path,
-                )))
+                );
+                // A non-text stream is handed back whole rather than summarised.
+                // The `Fold` still carries the path, so the bytes remain on disk
+                // and `emit` can stream them to the real fd.
+                if self.binary {
+                    Ok(StreamCapture::BinaryPassthrough(fold))
+                } else {
+                    Ok(StreamCapture::Folded(fold))
+                }
             }
         }
     }
@@ -264,6 +325,9 @@ mod tests {
         match capture {
             StreamCapture::Passthrough(bytes) => assert_eq!(bytes, raw),
             StreamCapture::Folded(_) => panic!("must not fold below the gate"),
+            StreamCapture::BinaryPassthrough(_) => {
+                panic!("must not cross the gate below it, text or not")
+            }
         }
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
@@ -352,15 +416,35 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_spills_losslessly_and_previews_lossily() {
+    fn invalid_utf8_is_not_folded_at_all() {
         let tmp = tempfile::tempdir().unwrap();
         let mut raw = Vec::new();
         for i in 0..20_000 {
             raw.extend_from_slice(&[0xff, 0xfe, b'a' + (i % 26) as u8, b'\n']);
         }
         let capture = sink(tmp.path(), 100).pump(&raw[..]).unwrap();
-        let StreamCapture::Folded(fold) = capture else {
-            panic!("expected a fold");
+
+        // Renamed from `invalid_utf8_spills_losslessly_and_previews_lossily`.
+        // The old name admitted the defect: the stream folded, and the preview
+        // went through `render`, which returns a `String`, so every 0xff/0xfe
+        // became U+FFFD. The bytes on disk were ALWAYS exact, which is exactly
+        // why this went unnoticed — only the printed stream was corrupt.
+        assert!(
+            matches!(capture, StreamCapture::BinaryPassthrough(_)),
+            "invalid UTF-8 above the gate must not take the fold path"
+        );
+        assert!(
+            !capture.is_folded(),
+            "a binary stream must not be reported as folded"
+        );
+        assert_eq!(
+            capture.kept_bytes(),
+            capture.raw_bytes(),
+            "every byte must reach the caller, so kept equals raw"
+        );
+
+        let StreamCapture::BinaryPassthrough(fold) = capture else {
+            unreachable!("just asserted");
         };
         assert_eq!(
             std::fs::read(&fold.path).unwrap(),
@@ -418,6 +502,9 @@ mod tests {
         match capture {
             StreamCapture::Passthrough(bytes) => assert!(bytes.is_empty()),
             StreamCapture::Folded(_) => panic!("empty stream must not fold"),
+            StreamCapture::BinaryPassthrough(_) => {
+                panic!("an empty stream is text, and must not spill at all")
+            }
         }
     }
 }
