@@ -21,18 +21,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
   its own shim, and every PATH shim failed with
   `%1 is not a valid Win32 application. (os error 193)`. The shim now rewrites
   `OGT_SHIM_DIR` through `cygpath -w` when `cygpath` is available, which is a no-op on Unix.
-- Never fold a stream that is not text. The token gate is a size gate, and crossing it commits
-  the stream to a `Fold`, whose `render` returns a `String`; the fold path therefore decoded as
-  UTF-8 and replaced every invalid byte with U+FFFD. Measured on a 129,292-byte PNG, the caller
-  received 16,124 mangled bytes, and a 2 MB binary arrived as 16,127. The fold file itself always
-  kept the true bytes, which is why this stayed invisible: only the printed stream changed, and
-  it changed silently, breaking any pipeline that consumed it. A stream containing a NUL byte or
-  invalid UTF-8 is now reported as `BinaryPassthrough`: it still spills, so memory stays bounded,
-  but it is written to the caller unchanged instead of being summarised. This restates the rule
-  `runner::spawn::emit` already applies to passthrough output — "written raw, never through a
-  `String`, never a lossy decode" — one step earlier, at the gate where the decision is made.
-  Verified byte-identical through the built binary on a 281,617-byte PNG: 281,617 in, 281,617
-  out, same SHA256, where the previous build returned 8,286 bytes.
+- Never fold a stream that is not text. A stream containing a NUL byte or invalid UTF-8 was
+  decoded as UTF-8, so invalid bytes reached the caller as U+FFFD and any pipeline consuming
+  the output broke silently. Such a stream now passes through unchanged.
 
 ## [0.1.0] - 2026-08-31
 
